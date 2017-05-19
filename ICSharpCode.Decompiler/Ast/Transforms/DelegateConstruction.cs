@@ -54,6 +54,7 @@ namespace ICSharpCode.Decompiler.Ast.Transforms
 		}
 		
 		List<string> currentlyUsedVariableNames = new List<string>();
+		List<TypeDeclaration> typeList = new List<TypeDeclaration>();
 		
 		public DelegateConstruction(DecompilerContext context) : base(context)
 		{
@@ -308,6 +309,8 @@ namespace ICSharpCode.Decompiler.Ast.Transforms
 		
 		public override object VisitBlockStatement(BlockStatement blockStatement, object data)
 		{
+			ReverseIndependentClosureOptimisations(blockStatement);
+
 			int numberOfVariablesOutsideBlock = currentlyUsedVariableNames.Count;
 			base.VisitBlockStatement(blockStatement, data);
 			foreach (ExpressionStatement stmt in blockStatement.Statements.OfType<ExpressionStatement>().ToArray()) {
@@ -452,6 +455,97 @@ namespace ICSharpCode.Decompiler.Ast.Transforms
 			}
 			currentlyUsedVariableNames.RemoveRange(numberOfVariablesOutsideBlock, currentlyUsedVariableNames.Count - numberOfVariablesOutsideBlock);
 			return null;
+		}
+
+		private static readonly IfElseStatement optimisedAnonymousPattern =
+			new IfElseStatement(
+				new BinaryOperatorExpression(
+					new AssignmentExpression(
+						new NamedNode("var", new IdentifierExpression(Pattern.AnyString)),
+						new NamedNode("cacheField",
+							new MemberReferenceExpression(new TypeReferenceExpression(new AnyNode()), Pattern.AnyString))),
+					BinaryOperatorType.Equality,
+					new NullReferenceExpression()),
+				new BlockStatement {
+					new ExpressionStatement(new AssignmentExpression(
+						new NamedNode("varAssign", new Backreference("var")),
+						new AssignmentExpression(
+							new Backreference("cacheField"),
+							new NamedNode("newExpr", new ObjectCreateExpression(new AnyNode(), new AnyNode(), new AnyNode()))
+						)
+					))
+				}
+			);
+
+		private void ReverseIndependentClosureOptimisations(BlockStatement blockStatement) 
+		{
+			foreach (var stmt in blockStatement.Statements.OfType<IfElseStatement>().ToArray()) {
+				var match = optimisedAnonymousPattern.Match(stmt);
+				if (!match.Success)
+					continue;
+
+				var newExpr = match.Get<ObjectCreateExpression>("newExpr").Single();
+
+				//ensure target is a ldftn
+				var target = (InvocationExpression)newExpr.Arguments.Last();
+				if (target.Annotation<Annotation>() == null)
+					continue;
+
+				var varNode = match.Get<AstNode>("var").Single();
+				var varName = varNode.Annotation<ILVariable>()?.Name;
+				if (varName == null)
+					continue;
+
+				//find all references to the variable
+				var varAssign = match.Get<AstNode>("varAssign").Single();
+				var varRefs = blockStatement.Descendants.OfType<IdentifierExpression>().Where(
+					expr => expr.Identifier == varName && expr != varNode && expr != varAssign).ToList();
+
+				//ensure all references are read only
+				if (varRefs.Any(expr => expr.Parent is AssignmentExpression && ((AssignmentExpression)expr.Parent).Left == expr))
+					continue;
+
+				var closureInst = (MemberReferenceExpression)newExpr.Arguments.First();
+
+				//remove the variable
+				PatternStatementTransform.FindVariableDeclaration(stmt, varName).Remove();
+				//change the reference to the closure field to the local var
+				closureInst.ReplaceWith(new IdentifierExpression(varName));
+				
+				//replace the references to the delegate with the new delegate creation
+				foreach (var identExpr in varRefs)
+					identExpr.ReplaceWith(target.Parent.Clone());
+
+				//delete the if block
+				stmt.Remove();
+
+				//remove the method
+				var anonMethod = ((IdentifierExpression) target.Arguments.Single()).Annotation<MethodReference>().ResolveWithinSameModule();
+				var typeDecl = typeList.SingleOrDefault(t => t.Annotation<TypeDefinition>() == anonMethod.DeclaringType);
+				if (typeDecl != null) { //can be null if we're just decompiling a method
+					typeDecl.Members.Single(m => m.Annotation<MethodDefinition>() == anonMethod).Remove();
+
+					//remove the cache field
+					var cacheField = match.Get<MemberReferenceExpression>("cacheField").Single().Annotation<FieldReference>().ResolveWithinSameModule();
+					typeDecl.Members.Single(m => m.Annotation<FieldDefinition>() == cacheField).Remove();
+
+					//compiler generated class no longer serves a purpose
+					if (!typeDecl.Members.OfType<MethodDefinition>().Any())
+						typeDecl.Remove();
+				}
+			}
+		}
+
+		public override object VisitTypeDeclaration(TypeDeclaration typeDeclaration, object data)
+		{
+			try {
+				typeList.Add(typeDeclaration);
+				return base.VisitTypeDeclaration(typeDeclaration, data);
+			}
+			finally {
+				if (!(typeDeclaration.Parent is TypeDeclaration))
+					typeList.Clear();
+			}
 		}
 
 		void EnsureVariableNameIsAvailable(AstNode currentNode, string name)
